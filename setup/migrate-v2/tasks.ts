@@ -1,12 +1,14 @@
 /**
  * migrate-v2 step: tasks
  *
- * Port v1 scheduled_tasks into v2 session inbound DBs.
+ * Port v1 scheduled_tasks into v2 task system sessions.
  *
  * v1: scheduled_tasks table (schedule_type, schedule_value, next_run)
- * v2: messages_in rows with kind='task' in per-session inbound.db
+ * v2: messages_in rows with kind='task' in the per-series task system session's
+ *     inbound.db (thread `system:tasks:<seriesId>`, messaging_group_id NULL —
+ *     tasks fire into an isolated session, not a chat session).
  *
- * Requires: db step must have run first (agent_groups + messaging_groups seeded).
+ * Requires: db step must have run first (agent_groups seeded).
  *
  * Usage: pnpm exec tsx setup/migrate-v2/tasks.ts <v1-path>
  */
@@ -18,13 +20,9 @@ import Database from 'better-sqlite3';
 import { DATA_DIR } from '../../src/config.js';
 import { initDb, closeDb } from '../../src/db/connection.js';
 import { getAgentGroupByFolder } from '../../src/db/agent-groups.js';
-import { getMessagingGroupByPlatform } from '../../src/db/messaging-groups.js';
 import { runMigrations } from '../../src/db/migrations/index.js';
-import { insertTask } from '../../src/modules/scheduling/db.js';
-import { openInboundDb, resolveSession } from '../../src/session-manager.js';
-import { readEnvFile } from '../../src/env.js';
-import { buildDiscordResolver, type DiscordResolver } from './discord-resolver.js';
-import { parseJid, v2PlatformId } from './shared.js';
+import { insertTaskRow } from '../../src/modules/scheduling/db.js';
+import { inboundDbPath, resolveTaskSession, withInboundDb } from '../../src/session-manager.js';
 
 interface V1Task {
   id: string;
@@ -49,15 +47,17 @@ function toCron(t: V1Task): { processAfter: string; recurrence: string | null } 
   }
 
   if (t.schedule_type === 'interval') {
-    const m = /^(\d+)([smhd])$/.exec(t.schedule_value.trim());
-    if (!m) return null;
-    const n = parseInt(m[1], 10);
-    const unit = m[2];
-    if (!n || n < 1) return null;
+    // v1 stores raw milliseconds for interval tasks (see task-scheduler.ts
+    // computeNextRun: `parseInt(task.schedule_value, 10)`), not a suffixed
+    // string — convert to the nearest cron-representable interval.
+    const ms = parseInt(t.schedule_value.trim(), 10);
+    if (!ms || ms < 1) return null;
+    const minutes = Math.round(ms / 60_000);
+    if (minutes < 1) return null;
     let cron: string | null = null;
-    if (unit === 'm' && n < 60) cron = `*/${n} * * * *`;
-    else if (unit === 'h' && n < 24) cron = `0 */${n} * * *`;
-    else if (unit === 'd' && n < 28) cron = `0 0 */${n} * *`;
+    if (minutes < 60) cron = `*/${minutes} * * * *`;
+    else if (minutes % 60 === 0 && minutes / 60 < 24) cron = `0 */${minutes / 60} * * *`;
+    else if (minutes % 1440 === 0 && minutes / 1440 < 28) cron = `0 0 */${minutes / 1440} * *`;
     if (!cron) return null;
     return { processAfter: t.next_run || now, recurrence: cron };
   }
@@ -106,62 +106,41 @@ async function main(): Promise<void> {
   let skipped = 0;
   let failed = 0;
 
-  // Mirrors db.ts: Discord platform_id needs API lookup to recover guildId.
-  let discordResolver: DiscordResolver | null = null;
-  const hasDiscord = activeTasks.some((t) => parseJid(t.chat_jid)?.channel_type === 'discord');
-  if (hasDiscord) {
-    const env = readEnvFile(['DISCORD_BOT_TOKEN']);
-    discordResolver = await buildDiscordResolver(env.DISCORD_BOT_TOKEN ?? '');
-  }
-
   for (const t of activeTasks) {
     try {
       const ag = getAgentGroupByFolder(t.group_folder);
       if (!ag) { skipped++; continue; }
 
-      const parsed = parseJid(t.chat_jid);
-      if (!parsed) { skipped++; continue; }
-
-      let platformId: string;
-      if (parsed.channel_type === 'discord') {
-        const resolved = discordResolver?.resolve(parsed.id) ?? null;
-        if (!resolved) { skipped++; continue; }
-        platformId = resolved;
-      } else {
-        platformId = v2PlatformId(parsed.channel_type, t.chat_jid);
-      }
-      const mg = getMessagingGroupByPlatform(parsed.channel_type, platformId);
-      if (!mg) { skipped++; continue; }
-
       const scheduling = toCron(t);
       if (!scheduling) { skipped++; continue; }
 
-      const { session } = resolveSession(ag.id, mg.id, null, 'shared');
-      const inboxDb = openInboundDb(ag.id, session.id);
-      try {
-        // Idempotence check
-        const existing = inboxDb
+      // Tasks fire into an isolated per-series system session, not a chat
+      // session — no messaging group or platform resolution needed.
+      const { session } = resolveTaskSession(ag.id, t.id);
+      if (!fs.existsSync(inboundDbPath(ag.id, session.id))) { skipped++; continue; }
+
+      const alreadyMigrated = withInboundDb(ag.id, session.id, (db) => {
+        const existing = db
           .prepare("SELECT id FROM messages_in WHERE id = ? AND kind = 'task'")
           .get(t.id) as { id: string } | undefined;
-        if (existing) { skipped++; continue; }
+        if (existing) return true;
 
-        insertTask(inboxDb, {
+        insertTaskRow(db, {
           id: t.id,
+          seriesId: t.id,
           processAfter: scheduling.processAfter,
           recurrence: scheduling.recurrence,
-          platformId,
-          channelType: parsed.channel_type,
-          threadId: null,
           content: JSON.stringify({
             prompt: t.prompt,
             script: t.script ?? null,
             migrated_from_v1: { original_id: t.id, context_mode: t.context_mode ?? null },
           }),
         });
-        migrated++;
-      } finally {
-        inboxDb.close();
-      }
+        return false;
+      });
+
+      if (alreadyMigrated) { skipped++; continue; }
+      migrated++;
     } catch (err) {
       failed++;
       console.error(`TASK_ERROR:${t.id}:${err instanceof Error ? err.message : String(err)}`);

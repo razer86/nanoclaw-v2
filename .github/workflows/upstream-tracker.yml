@@ -1,0 +1,107 @@
+name: Upstream tracker
+
+# Watches nanocoai/nanoclaw's main branch and posts a Discord summary via the
+# NanoClaw bot itself when new commits land, so this fork doesn't silently
+# drift for months before an upgrade is attempted (see docs/migration-*.md
+# for what a 3-month-stale upgrade costs in practice).
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # daily, 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare against last-seen upstream commit
+        id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          STATE_FILE=.github/upstream-state.json
+          LATEST=$(gh api repos/nanocoai/nanoclaw/commits/main -q .sha)
+
+          if [ -f "$STATE_FILE" ]; then
+            LAST_SEEN=$(jq -r .sha "$STATE_FILE")
+          else
+            LAST_SEEN=""
+          fi
+
+          if [ "$LATEST" = "$LAST_SEEN" ]; then
+            echo "up to date at $LATEST"
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "has_new=true" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$LAST_SEEN" ]; then
+            # First run with no prior state — don't dump the whole history,
+            # just start tracking from here.
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "shortlog=(first run — starting tracking from $LATEST)" >> "$GITHUB_OUTPUT"
+          else
+            COMPARE=$(gh api "repos/nanocoai/nanoclaw/compare/${LAST_SEEN}...${LATEST}")
+            COUNT=$(echo "$COMPARE" | jq -r '.ahead_by')
+            SHORTLOG=$(echo "$COMPARE" | jq -r '.commits[-10:] | reverse | .[] | "- " + (.commit.message | split("\n")[0]) + " (" + (.sha[0:7]) + ")"')
+            echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+            # Commit messages come from upstream (untrusted input) — use a
+            # random delimiter so a crafted message can't break out of the
+            # heredoc and inject extra GITHUB_OUTPUT keys.
+            DELIM="SHORTLOG_$(openssl rand -hex 8)"
+            {
+              echo "shortlog<<$DELIM"
+              echo "$SHORTLOG"
+              echo "$DELIM"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post to Discord
+        if: steps.diff.outputs.has_new == 'true'
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_TRACKER_CHANNEL_ID }}
+          COUNT: ${{ steps.diff.outputs.count }}
+          SHORTLOG: ${{ steps.diff.outputs.shortlog }}
+          LATEST: ${{ steps.diff.outputs.latest }}
+        run: |
+          set -euo pipefail
+          if [ "$COUNT" = "0" ]; then
+            CONTENT="🔭 Started tracking nanocoai/nanoclaw upstream from \`${LATEST:0:7}\`."
+          else
+            COMPARE_URL="https://github.com/nanocoai/nanoclaw/commits/main"
+            CONTENT=$(printf '📦 **%s new commit(s)** on nanocoai/nanoclaw main since last check:\n\n%s\n\n%s' "$COUNT" "$SHORTLOG" "$COMPARE_URL")
+          fi
+
+          # Discord message content caps at 2000 chars — truncate defensively.
+          CONTENT=$(echo "$CONTENT" | cut -c1-1900)
+
+          jq -n --arg content "$CONTENT" '{content: $content}' > /tmp/discord-payload.json
+
+          curl -sf -X POST \
+            -H "Authorization: Bot ${DISCORD_BOT_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary @/tmp/discord-payload.json \
+            "https://discord.com/api/v10/channels/${DISCORD_CHANNEL_ID}/messages"
+
+      - name: Record last-seen commit
+        if: steps.diff.outputs.has_new == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p .github
+          jq -n --arg sha "${{ steps.diff.outputs.latest }}" --arg checked_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{sha: $sha, checked_at: $checked_at}' > .github/upstream-state.json
+
+          git config user.name "upstream-tracker[bot]"
+          git config user.email "actions@users.noreply.github.com"
+          git add .github/upstream-state.json
+          git commit -m "chore: record upstream commit ${{ steps.diff.outputs.latest }}"
+          git push
