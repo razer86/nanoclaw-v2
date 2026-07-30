@@ -276,15 +276,24 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         clearContinuation(config.providerName);
       }
 
-      // Write error response so the user knows something went wrong
-      writeMessageOut({
-        id: generateId(),
-        kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
-      });
+      // Write error response so the user knows something went wrong — unless
+      // processQuery already delivered this exact error via deliverErrorResult.
+      // The SDK re-throws the same error result text when its subprocess exits
+      // right after emitting it, which would otherwise land here a second time
+      // as an uncorrelated duplicate (see the `alreadyDelivered` tag above).
+      if ((err as { alreadyDelivered?: boolean })?.alreadyDelivered) {
+        log('Error already delivered via deliverErrorResult — skipping duplicate');
+      } else {
+        writeMessageOut({
+          id: generateId(),
+          in_reply_to: routing.inReplyTo,
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: `Error: ${errMsg}` }),
+        });
+      }
 
       // The batch is still acked completed below (no redelivery). Without
       // this line the only log trace of the errored turn is "Query error"
@@ -354,6 +363,13 @@ export async function processQuery(
   // Once-per-turn guard for the task-run "<message> block was not delivered"
   // nudge — mirrors unwrappedNudged for chat turns.
   let taskBlockNudged = false;
+  // Text of the last error already delivered via deliverErrorResult. The SDK
+  // re-surfaces the same error as a thrown exception when its subprocess
+  // exits after an error result (see Query.readMessages in the SDK: it wraps
+  // the exit in `Claude Code returned an error result: ${lastErrorResultText}`
+  // whenever a result carried error text). Tracked so the outer catch can
+  // recognize that echo and skip sending a duplicate chat message for it.
+  let deliveredErrorText: string | undefined;
   // Prompt queue for the exchange hook — each result event consumes the
   // oldest unanswered prompt, except a wrapping-retry result, which answers
   // the same prompt again. Unused (and unmaintained) when the provider
@@ -516,6 +532,7 @@ export async function processQuery(
             // scratchpad, and skip the re-wrap nudge — it would just re-hammer
             // the failing gateway turn after turn.
             deliverErrorResult(event.text, routing);
+            deliveredErrorText = event.text;
             notifyExchangeComplete(onExchangeComplete, {
               prompt: archivePrompts[0] ?? initialPrompt,
               result: event.text,
@@ -565,6 +582,12 @@ export async function processQuery(
       continuation: queryContinuation ?? initialContinuation,
       status: 'error',
     });
+    // The SDK wraps a post-result subprocess exit as a thrown error quoting
+    // the same text we already sent via deliverErrorResult. Tag it so the
+    // caller's fallback error-delivery doesn't send it a second time.
+    if (deliveredErrorText !== undefined && errMsg.includes(deliveredErrorText)) {
+      (err as Error & { alreadyDelivered?: boolean }).alreadyDelivered = true;
+    }
     throw err;
   } finally {
     done = true;

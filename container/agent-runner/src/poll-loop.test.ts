@@ -436,6 +436,29 @@ describe('error result with no <message> envelope', () => {
     expect(pushes).toHaveLength(1);
     expect(pushes[0]).toContain('was not delivered');
   });
+
+  it('tags a post-result exit error as alreadyDelivered so the caller skips a duplicate send', async () => {
+    // Mirrors the real SDK: after yielding an error result, its subprocess
+    // exit gets wrapped as a thrown `Claude Code returned an error result: ...`
+    // quoting the same text. Only one message should ever reach the channel
+    // for this turn.
+    const authText = 'Failed to authenticate. API Error: 401 OAuth access token has expired. Re-authenticate to continue.';
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'sess-1' };
+      yield { type: 'result', text: authText, isError: true };
+      throw new Error(`Claude Code returned an error result: ${authText}`);
+    }
+    const query: AgentQuery = { push: () => {}, end: () => {}, events: events(), abort: () => {} };
+
+    await expect(processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined)).rejects.toMatchObject(
+      { alreadyDelivered: true },
+    );
+
+    // deliverErrorResult already sent the one message this turn gets.
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe(authText);
+  });
 });
 
 describe('isCorruptionError', () => {
