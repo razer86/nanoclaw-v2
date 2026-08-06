@@ -216,9 +216,38 @@ const postToolUseHook: HookCallback = async () => {
 };
 
 /**
+ * Floor between archive writes, shared across all sessions of this agent
+ * group (the conversations/ dir is per-group, not per-session). A stuck
+ * task or a broken provider credential can retry every sweep tick (60s) for
+ * days; without a floor each retry's PreCompact fires and dumps a fresh
+ * multi-MB transcript, which is exactly how a 3-day auth-failure storm once
+ * wrote 20GB of near-duplicate archives and filled the host disk. Operator
+ * overridable for anyone who wants finer-grained history.
+ */
+function archiveMinIntervalMs(): number {
+  return Number(process.env.CLAUDE_ARCHIVE_MIN_INTERVAL_MS) || 5 * 60 * 1000;
+}
+
+/** Latest mtime among existing archive files, or null if the dir is empty/missing. */
+function mostRecentArchiveMs(conversationsDir: string): number | null {
+  try {
+    let latest = 0;
+    for (const f of fs.readdirSync(conversationsDir)) {
+      if (!f.endsWith('.md')) continue;
+      const mtime = fs.statSync(path.join(conversationsDir, f)).mtimeMs;
+      if (mtime > latest) latest = mtime;
+    }
+    return latest || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Read a Claude transcript .jsonl, render a markdown summary, and drop it into
  * the agent's `conversations/` folder so context survives a compaction or a
  * session rotation. Best-effort: returns false (and logs) on any failure.
+ * Throttled by archiveMinIntervalMs() — see its comment.
  */
 function archiveTranscriptFile(
   transcriptPath: string | undefined,
@@ -231,6 +260,15 @@ function archiveTranscriptFile(
   }
 
   try {
+    const conversationsDir = process.env.NANOCLAW_CONVERSATIONS_DIR || '/workspace/agent/conversations';
+    fs.mkdirSync(conversationsDir, { recursive: true });
+    const lastMs = mostRecentArchiveMs(conversationsDir);
+    const minIntervalMs = archiveMinIntervalMs();
+    if (lastMs !== null && Date.now() - lastMs < minIntervalMs) {
+      log(`Skipping archive — throttled (last write ${Math.round((Date.now() - lastMs) / 1000)}s ago, floor ${minIntervalMs / 1000}s)`);
+      return false;
+    }
+
     const content = fs.readFileSync(transcriptPath, 'utf-8');
     const messages = parseTranscript(content);
     if (messages.length === 0) return false;
@@ -257,8 +295,6 @@ function archiveTranscriptFile(
           .slice(0, 50)
       : `conversation-${new Date().getHours().toString().padStart(2, '0')}${new Date().getMinutes().toString().padStart(2, '0')}`;
 
-    const conversationsDir = process.env.NANOCLAW_CONVERSATIONS_DIR || '/workspace/agent/conversations';
-    fs.mkdirSync(conversationsDir, { recursive: true });
     // Local calendar date — the fallback `name` above already uses local
     // hours, and the agent navigates conversations/ by these date prefixes.
     const filename = `${formatLocalStamp(new Date(), TIMEZONE).slice(0, 10)}-${name}.md`;

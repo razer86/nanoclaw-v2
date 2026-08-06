@@ -3,6 +3,7 @@ import {
   getPendingMessages,
   markProcessing,
   markCompleted,
+  markFailed,
   markScriptSkipped,
   type MessageInRow,
 } from './db/messages-in.js';
@@ -526,6 +527,17 @@ export async function processQuery(
           // A corrective retry handles delivery only; its result is not a
           // second run summary.
           if (routing.taskRun && !taskBlockNudged) autoAppendTaskLog(event.text);
+          // A task run that fails outright (no <message> delivered, provider-level
+          // error) must NOT be acked 'completed' — recurrence's trailingFailedRuns /
+          // SCRIPT_FAIL_PAUSE_CAP circuit breaker (modules/scheduling/recurrence.ts)
+          // only sees 'failed' rows, and today only a broken pre-task *script* trips
+          // it. Without this override a broken provider credential (e.g. an expired
+          // Anthropic OAuth token) retries at raw cron cadence forever — six straight
+          // hours of that once fed a once-a-minute archive-write storm that filled
+          // the host disk.
+          if (routing.taskRun && sent === 0 && event.isError === true) {
+            for (const id of initialBatchIds) markFailed(id);
+          }
           if (sent === 0 && event.isError === true && !routing.taskRun) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
             // <message> envelope: deliver the notice instead of dropping it as
